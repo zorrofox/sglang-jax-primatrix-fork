@@ -3,6 +3,7 @@ import json
 import logging
 import os
 from enum import Enum, IntEnum, auto
+from functools import cached_property
 
 import jax.numpy as jnp
 from transformers import PretrainedConfig
@@ -49,6 +50,7 @@ _FUSED_MOE_V2_SUPPORTED_ARCHITECTURES = frozenset(
         "BailingMoeV2ForCausalLM",
         "BailingMoeV2_5ForCausalLM",
         "MiMoV2ForCausalLM",
+        "MiMoV2ForConditionalGeneration",
         "MiMoV2FlashForCausalLM",
         "GlmMoeDsaForCausalLM",
     }
@@ -252,6 +254,7 @@ class ModelConfig:
                 ignored = list(self.quantization_config.ignored_layers or [])
                 ignored.extend(["model.eh_proj", "model.mtp_block.self_attn.o_proj"])
                 self.quantization_config.ignored_layers = ignored
+
         # Check model type
         self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
         self.is_multimodal = any(
@@ -557,6 +560,13 @@ class ModelConfig:
         logger.info("No quantization config found in HF config or user config")
         return None
 
+    @cached_property
+    def resolved_model_architecture(self) -> tuple[type, str]:
+        """Resolve once, after draft architecture selection, without changing HF metadata."""
+        from sgl_jax.srt.model_loader.arch import resolve_model_architecture
+
+        return resolve_model_architecture(self)
+
     def _apply_model_specific_config(self) -> None:
         """Invoke the model class's optional `patch_model_config` hook so model
         files can own their own config overrides (attention_arch, head_dim,
@@ -566,14 +576,15 @@ class ModelConfig:
         `attention_arch` for backend selection — so patches land in time.
         Import is lazy because model modules import ModelConfig back.
         """
-        from sgl_jax.srt.models.registry import ModelRegistry
         from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
 
+        self.is_in_model_multimodal = False
         try:
-            model_cls, _ = ModelRegistry.resolve_model_cls(self.hf_config.architectures)
+            model_cls, _ = self.resolved_model_architecture
         except ValueError:
             return
-        self.is_multimodal |= issubclass(model_cls, InModelMultimodalContract)
+        self.is_in_model_multimodal = issubclass(model_cls, InModelMultimodalContract)
+        self.is_multimodal |= self.is_in_model_multimodal
         patch = getattr(model_cls, "patch_model_config", None)
         if patch is not None:
             patch(self)
@@ -990,6 +1001,7 @@ multimodal_model_archs = [
     "LlavaQwenForCausalLM",
     "LlavaForConditionalGeneration",
     "LlavaVidForCausalLM",
+    "MiMoV2ForConditionalGeneration",
     "MiniCPMO",
     "MiniCPMV",
     "Mistral3ForConditionalGeneration",

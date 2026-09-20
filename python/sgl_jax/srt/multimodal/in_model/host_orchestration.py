@@ -11,7 +11,6 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.models.registry import ModelRegistry
 from sgl_jax.srt.multimodal.common.modality_enum import (
     Modality,
     MultimodalDataItem,
@@ -76,7 +75,7 @@ def build_multimodal_batch(
     per_dp_token: int,
 ) -> _MultimodalBatch | None:
     """Build tasks for placeholders visible in this prefill chunk."""
-    if not ModelRegistry.is_in_model_multimodal(model_config.hf_config.architectures):
+    if not model_config.is_in_model_multimodal:
         return None
 
     grouped: dict[Modality, list[ItemTask]] = {}
