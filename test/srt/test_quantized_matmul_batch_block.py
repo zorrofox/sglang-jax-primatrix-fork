@@ -29,7 +29,8 @@ def _install_table(monkeypatch, x_dtype, seed_batch_block):
         blockwise_utils, "_get_blockwise_tuning_api", lambda: (TunedValue, None, table)
     )
     monkeypatch.setattr(blockwise_utils, "_get_current_tpu_version", lambda: 7)
-    monkeypatch.delenv("SGLANG_JAX_QMM_MIN_BATCH_BLOCK", raising=False)
+    # pin the floor off: the tests below assert the table's own choice first
+    monkeypatch.setenv("SGLANG_JAX_QMM_MIN_BATCH_BLOCK", "0")
 
 
 def _resolve(n_batch, x_dtype):
@@ -70,5 +71,12 @@ def test_min_batch_block_floor_is_read_at_call_time(monkeypatch):
     _install_table(monkeypatch, jnp.bfloat16, 64)
     assert _resolve(8192, jnp.bfloat16).batch_block_size == 64
     monkeypatch.setenv("SGLANG_JAX_QMM_MIN_BATCH_BLOCK", "512")
+    assert _resolve(8192, jnp.bfloat16).batch_block_size == 512
+    assert _resolve(256, jnp.bfloat16).batch_block_size == 64  # below the floor's batch
+
+
+def test_min_batch_block_default_is_512(monkeypatch):
+    _install_table(monkeypatch, jnp.bfloat16, 64)
+    monkeypatch.delenv("SGLANG_JAX_QMM_MIN_BATCH_BLOCK", raising=False)
     assert _resolve(8192, jnp.bfloat16).batch_block_size == 512
     assert _resolve(256, jnp.bfloat16).batch_block_size == 64  # below the floor's batch
