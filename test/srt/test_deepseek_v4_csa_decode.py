@@ -43,11 +43,12 @@ def _tpu_generation() -> str:
     return "other"
 
 
-# Kernel-vs-numpy tolerance per TPU generation. v7x matches to 2e-4. v6e differs by
-# up to 6.1e-4 abs on these shapes (measured on a v6e host: 3/8 cases over 2e-4, max
-# 6.1e-4); JAX_DEFAULT_MATMUL_PRECISION=highest does not change it, so it is
-# accumulation/rounding order between generations, not a precision flag.
-_KERNEL_TOL = {"v6e": 1e-3}.get(_tpu_generation(), 2e-4)
+# Kernel-vs-numpy tolerance. On a CPU host the interpret path is exact to 2e-4. On a
+# TPU host the same interpret path runs its bf16 dots on the device and differs from
+# the f32 numpy reference by up to 6.1e-4 abs (measured on v6e and v7x alike: the same
+# 3/8 cases, identical mismatch counts); JAX_DEFAULT_MATMUL_PRECISION=highest does
+# not change it. 1e-3 on any TPU, 2e-4 elsewhere.
+_KERNEL_TOL = 1e-3 if _tpu_generation() in ("v6e", "v7x") else 2e-4
 
 
 @pytest.mark.parametrize("tokens,rows", [(3, 4), (9, 4), (5, 1)])

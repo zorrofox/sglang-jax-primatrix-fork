@@ -170,11 +170,12 @@ def _tpu_generation() -> str:
     return "other"
 
 
-@pytest.mark.skipif(
-    _tpu_generation() == "v6e",
-    reason="flat one-record compressed pool (DSV4_HCA_FLAT_COMPRESSED=1, opt-in) needs "
-    "page DMAs at unaligned row offsets; v6e Mosaic rejects them "
-    "(kernels/hca/attention.py _load_small_page). v7x only.",
+@pytest.mark.xfail(
+    _tpu_generation() in ("v6e", "v7x"),
+    reason="flat one-record compressed pool (DSV4_HCA_FLAT_COMPRESSED=1, opt-in) issues "
+    "page DMAs at unaligned row offsets; Mosaic rejects the kernel on TPU "
+    "(kernels/hca/attention.py _load_small_page). Passes in CPU interpret mode.",
+    strict=True,
 )
 def test_flat_one_record_pool_matches_the_physical_view():
     """The kernels accept the compressed pool as flat [rows, D] with one record per
