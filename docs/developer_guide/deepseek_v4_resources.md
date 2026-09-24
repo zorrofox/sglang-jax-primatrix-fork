@@ -100,7 +100,7 @@ side per request: a request with `completed = length // 128` records contributes
 `max(1, ceil(completed / (P/128)))` compressed pages, a request with no
 completed record contributes the dummy page 0, and an inactive request
 contributes one dummy page and one page's worth of cumulative length
-(`srt/layers/attention/dsv4/hca.py:115-118`, inactive branch `:85-90`).
+(`srt/layers/attention/dsv4/hca.py:115-118`, inactive branch `:85-90`). The flat view is TPU v7x only: its one-record page DMAs start at unaligned row offsets, which Mosaic on TPU v6e rejects at compile time (`kernels/hca/attention.py`, `_load_small_page`); the default 4-D layout runs on both.
 
 ## Request state and updates
 

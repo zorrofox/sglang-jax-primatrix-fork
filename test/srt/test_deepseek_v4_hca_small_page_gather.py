@@ -10,6 +10,7 @@ requests, prefixes, query blocks, and boundary writes.
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from sgl_jax.srt.kernels.hca.attention import INERT_QUERY_OFFSET, ragged_attention
 from sgl_jax.srt.kernels.hca.hca import HCAMetadata
@@ -159,6 +160,22 @@ def test_one_record_pages_match_dense_reference_across_requests():
     np.testing.assert_allclose(out, ref, rtol=2e-2, atol=2e-2)
 
 
+def _tpu_generation() -> str:
+    """ "v6e" / "v7x" / "other" from the local device kind ("TPU v6 lite", "TPU7x", ...)."""
+    kind = jax.devices()[0].device_kind.lower()
+    if "v6" in kind:
+        return "v6e"
+    if "7x" in kind or "v7" in kind:
+        return "v7x"
+    return "other"
+
+
+@pytest.mark.skipif(
+    _tpu_generation() == "v6e",
+    reason="flat one-record compressed pool (DSV4_HCA_FLAT_COMPRESSED=1, opt-in) needs "
+    "page DMAs at unaligned row offsets; v6e Mosaic rejects them "
+    "(kernels/hca/attention.py _load_small_page). v7x only.",
+)
 def test_flat_one_record_pool_matches_the_physical_view():
     """The kernels accept the compressed pool as flat [rows, D] with one record per
     page (its native layout; the 4-D view costs a whole-pool copy per layer) and
