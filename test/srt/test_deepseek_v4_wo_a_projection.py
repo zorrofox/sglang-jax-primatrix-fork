@@ -1,8 +1,13 @@
 """Fused inverse-RoPE + wo_a kernel (interpret) matches the model's XLA path."""
 
+import os
+
+os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=16")
+
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from sgl_jax.srt.kernels.dsv4.wo_a_projection import widen_cos_sin, wo_a_projection
 from sgl_jax.srt.layers.attention.dsv4.o_projection import group_wo_a
@@ -80,4 +85,70 @@ def test_fused_wo_a_projection_wrapper_single_device():
         got = fused_wo_a_projection(
             x, cos, sin, fused_w, mesh=mesh, rope_head_dim=RD, dtype=jnp.bfloat16, interpret=True
         )
+    np.testing.assert_allclose(np.asarray(got, np.float32), want, rtol=2e-2, atol=2e-2)
+
+
+def test_partial_group_kernel_matches_reference():
+    """Four heads of an eight-head group: the per-head accumulation path equals the
+    matching rows of the whole-group contraction."""
+    rng = np.random.default_rng(2)
+    T, D, R, RD = 16, 256, 64, 64
+    x = jnp.asarray(rng.standard_normal((T, 8, D)), jnp.bfloat16)
+    ang = rng.uniform(0, 6.28, size=(T, RD // 2))
+    cos, sin = jnp.asarray(np.cos(ang), jnp.float32), jnp.asarray(np.sin(ang), jnp.float32)
+    wo_a_ck = jnp.asarray(rng.standard_normal((R, 8 * D)) * 0.05, jnp.bfloat16)  # one group
+    cos_sin = widen_cos_sin(cos, sin, rope_head_dim=RD, inverse=True)
+    whole = np.asarray(wo_a_projection(x, wo_a_ck.T, cos_sin, tile_t=8, interpret=True), np.float32)
+    w = np.asarray(wo_a_ck.T, np.float32)  # [8D, R]
+    lo = wo_a_projection(x[:, :4, :], jnp.asarray(w[: 4 * D]), cos_sin, tile_t=8, interpret=True)
+    hi = wo_a_projection(x[:, 4:, :], jnp.asarray(w[4 * D :]), cos_sin, tile_t=8, interpret=True)
+    got = np.asarray(lo, np.float32) + np.asarray(hi, np.float32)
+    np.testing.assert_allclose(got, whole, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(len(jax.devices()) < 16, reason="needs 16 devices")
+def test_fused_wo_a_projection_split_groups_sixteen_devices():
+    """tensor=16 over G=8 groups: per-device half-group partials + reduce-scatter equal
+    the reference, with the usual [T, G*R] column sharding."""
+    from sgl_jax.srt.layers.attention.dsv4.o_projection import (
+        fuse_wo_a_weights,
+        fused_wo_a_projection,
+        group_split,
+    )
+
+    mesh = jax.sharding.Mesh(
+        np.asarray(jax.devices()[:16], object).reshape(1, 16),
+        ("data", "tensor"),
+        axis_types=(jax.sharding.AxisType.Explicit,) * 2,
+    )
+    assert group_split(mesh, 8) == 2
+    rng = np.random.default_rng(3)
+    T, G, D, R, RD = 8, 8, 128, 32, 64
+    x = jnp.asarray(rng.standard_normal((T, 8 * G, D)), jnp.float32)
+    ang = rng.uniform(0, 6.28, size=(T, RD // 2))
+    cos, sin = jnp.asarray(np.cos(ang), jnp.float32), jnp.asarray(np.sin(ang), jnp.float32)
+    wo_a_ck = jnp.asarray(rng.standard_normal((G * R, 8 * D)) * 0.05, jnp.bfloat16)
+    want = np.asarray(_reference(x, cos, sin, wo_a_ck, num_groups=G, rope_head_dim=RD), np.float32)
+    with jax.set_mesh(mesh):
+        x = jax.device_put(
+            x, jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data", "tensor", None))
+        )
+        rope_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data", None))
+        cos, sin = jax.device_put((cos, sin), (rope_sharding, rope_sharding))
+        grouped = group_wo_a(wo_a_ck, num_groups=G)
+        fused_w = fuse_wo_a_weights(grouped, mesh=mesh)
+        assert fused_w.shape == (16, 4 * D, R)
+        got = fused_wo_a_projection(
+            x,
+            cos,
+            sin,
+            fused_w,
+            mesh=mesh,
+            rope_head_dim=RD,
+            dtype=jnp.bfloat16,
+            interpret=True,
+            num_groups=G,
+        )
+    assert got.shape == (T, G * R)
+    assert got.sharding.spec == jax.sharding.PartitionSpec("data", "tensor")
     np.testing.assert_allclose(np.asarray(got, np.float32), want, rtol=2e-2, atol=2e-2)

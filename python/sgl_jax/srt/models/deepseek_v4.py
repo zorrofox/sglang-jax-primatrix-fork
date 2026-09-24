@@ -910,9 +910,15 @@ class DeepseekV4Attention(nnx.Module):
         self.norm_eps = config.rms_norm_eps
         self.index_topk = config.index_topk
         self.dtype = dtype
-        if self.num_heads % self.num_groups or self.num_groups % mesh.shape["tensor"]:
+        tp = int(mesh.shape["tensor"])
+        if (
+            self.num_heads % self.num_groups
+            or self.num_heads % tp
+            or (self.num_groups % tp and tp % self.num_groups)
+        ):
             raise ValueError(
-                "V4 heads must divide into output groups, and groups must divide by TP"
+                "V4 heads must divide into output groups, and TP must divide the groups "
+                "or be a multiple of them"
             )
         self.wq_a = _linear(
             config.hidden_size,
@@ -971,18 +977,28 @@ class DeepseekV4Attention(nnx.Module):
         """
         from sgl_jax.srt.layers.attention.dsv4.o_projection import (
             fuse_wo_a_weights,
+            group_split,
             group_wo_a,
             use_fused_wo_a,
         )
 
+        split = group_split(self.mesh, self.num_groups)
+        if split > 1 and not use_fused_wo_a():
+            raise NotImplementedError(
+                "TP wider than o_groups needs the fused wo_a path (DSV4_FUSED_WO_A=1)"
+            )
         with jax.set_mesh(self.mesh):
+            # Whole groups per device shard the group axis; split groups are re-cut
+            # into per-device blocks by fuse_wo_a_weights, so the [G, D, R] view stays
+            # replicated for a moment (64 MB per layer, transient).
+            group_sharding = P(None, None, None) if split > 1 else P("tensor", None, None)
             weights = group_wo_a(
                 _checkpoint_matrix(self.wo_a),
                 num_groups=self.num_groups,
-                out_sharding=NamedSharding(self.mesh, P("tensor", None, None)),
+                out_sharding=NamedSharding(self.mesh, group_sharding),
             )
             if use_fused_wo_a():
-                # The fused kernel wants [8*head_dim, G*R]; keep only that copy.
+                # The fused kernel wants [8*head_dim, G*R] (or per-device blocks); keep only that copy.
                 self.wo_a_fused = nnx.Param(fuse_wo_a_weights(weights, mesh=self.mesh))
                 return
         self.wo_a_grouped = nnx.Param(weights)
@@ -1098,9 +1114,14 @@ class DeepseekV4Attention(nnx.Module):
                 mesh=self.mesh,
                 rope_head_dim=self.rope_head_dim,
                 dtype=self.dtype,
+                num_groups=self.num_groups,
             )
             output, _ = self.wo_b(reduced, out_sharding=wo_out_sharding)
             return output, updates
+        if int(self.mesh.shape["tensor"]) > self.num_groups:
+            raise NotImplementedError(
+                "TP wider than o_groups needs the fused wo_a path (DSV4_FUSED_WO_A=1)"
+            )
         output = apply_dsv4_partial_rope(
             output, cos[:, None, :], sin[:, None, :], rope_head_dim=self.rope_head_dim, inverse=True
         )

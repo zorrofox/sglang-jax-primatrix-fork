@@ -27,6 +27,12 @@ Semantics (per token ``t``, group ``g``)::
 
 ``wo_a`` may be bf16 (no scale) or fp8 with a per-output-column scale; with fp8
 weights the activations are quantized to fp8 per row inside the kernel.
+
+The heads-per-group count is read from ``wo_a``: ``reduction // head_dim``. Eight is
+the checkpoint's group and takes the single-pass path; a smaller count (a device that
+owns only part of a group when the tensor axis is wider than ``o_groups``, e.g. 16
+devices for 8 groups) accumulates one dot per head. The caller then reduces the
+partial group outputs across the devices that share a group.
 """
 
 from __future__ import annotations
@@ -113,8 +119,8 @@ def _rope_heads(x, cos_sin, *, head_dim):
 
 
 def _kernel(
-    x_ref,  # (tile_t, 8, head_dim) bf16
-    w_ref,  # (D, tile_r) bf16 | fp8
+    x_ref,  # (tile_t, heads_per_group, head_dim) bf16
+    w_ref,  # (heads_per_group*head_dim, tile_r) bf16 | fp8
     scale_ref,  # (1, tile_r) f32
     cos_sin_ref,  # (tile_t, 2*LANE) f32
     out_ref,  # (tile_t, tile_r)
@@ -123,6 +129,7 @@ def _kernel(
     num_sub_t: int,
     quantize_activations: bool,
     head_dim: int,
+    heads_per_group: int,
     interpret: bool,
 ):
     rhs = w_ref[...]
@@ -132,28 +139,45 @@ def _kernel(
     cos_sin = cos_sin_ref[...]
     sub_t = tile_t // num_sub_t
     out_dtype = out_ref.dtype
+    dims = (((1,), (0,)), ((), ()))
     for s in range(num_sub_t):
         rows = slice(s * sub_t, (s + 1) * sub_t)
         x = _rope_heads(x_ref[rows], cos_sin[rows], head_dim=head_dim)
-        x = x.reshape(sub_t, -1)
         inv = None
-        if quantize_activations:
-            amax = jnp.max(jnp.abs(x), axis=1, keepdims=True)
-            inv = (FP8_E4M3_MAX / jnp.maximum(amax, jnp.bfloat16(1e-30))).astype(jnp.bfloat16)
-            lhs = (x * inv).astype(jnp.float8_e4m3fn)
+        if heads_per_group == SUBLANE:
+            # Full group: one (sub_t, 8*head_dim) x (8*head_dim, tile_r) MXU pass.
+            x = x.reshape(sub_t, -1)
+            if quantize_activations:
+                amax = jnp.max(jnp.abs(x), axis=1, keepdims=True)
+                inv = (FP8_E4M3_MAX / jnp.maximum(amax, jnp.bfloat16(1e-30))).astype(jnp.bfloat16)
+                lhs = (x * inv).astype(jnp.float8_e4m3fn)
+            else:
+                lhs = x.astype(jnp.float32) if interpret else x
+            partial = jax.lax.dot_general(lhs, rhs, dims, preferred_element_type=jnp.float32)
         else:
-            lhs = x.astype(jnp.float32) if interpret else x
-        partial = jax.lax.dot_general(
-            lhs, rhs, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32
-        )
+            # Partial group (fewer than eight heads on this device): one dot per head,
+            # accumulated in f32; avoids collapsing a sub-8 sublane axis into lanes.
+            if quantize_activations:
+                amax = jnp.max(jnp.abs(x), axis=(1, 2), keepdims=True)[:, 0, :]
+                inv = (FP8_E4M3_MAX / jnp.maximum(amax, jnp.bfloat16(1e-30))).astype(jnp.bfloat16)
+            partial = None
+            for h in range(heads_per_group):
+                xh = x[:, h, :]
+                if quantize_activations:
+                    lhs = (xh * inv).astype(jnp.float8_e4m3fn)
+                else:
+                    lhs = xh.astype(jnp.float32) if interpret else xh
+                rhs_h = rhs[h * head_dim : (h + 1) * head_dim, :]
+                term = jax.lax.dot_general(lhs, rhs_h, dims, preferred_element_type=jnp.float32)
+                partial = term if partial is None else partial + term
         if quantize_activations:
             partial = partial * (1.0 / inv.astype(jnp.float32))
         out_ref[rows] = (partial * scale).astype(out_dtype)
 
 
 def wo_a_projection(
-    x,  # [T, G*8, head_dim] bf16
-    wo_a,  # [8*head_dim, G*R] bf16 or fp8
+    x,  # [T, G*heads_per_group, head_dim] bf16 (heads_per_group = 8 for whole groups)
+    wo_a,  # [heads_per_group*head_dim, G*R] bf16 or fp8
     cos_sin,  # [T, 2*LANE] f32 (see widen_cos_sin)
     wo_a_scale=None,  # [G*R] f32 for fp8 weights
     *,
@@ -170,11 +194,14 @@ def wo_a_projection(
         raise ValueError(f"x must be [T, heads, head_dim], got {x.shape}")
     num_tokens, num_heads, head_dim = x.shape
     reduction, out_features = wo_a.shape
-    if reduction != SUBLANE * head_dim or num_heads % SUBLANE:
-        raise ValueError("wo_a_projection needs 8 heads per group: wo_a [8*head_dim, G*R]")
     if head_dim % LANE:
         raise ValueError("head_dim must be a multiple of 128")
-    num_groups = num_heads // SUBLANE
+    if reduction % head_dim or reduction > SUBLANE * head_dim:
+        raise ValueError("wo_a rows must be heads_per_group*head_dim with heads_per_group <= 8")
+    heads_per_group = reduction // head_dim
+    if num_heads % heads_per_group:
+        raise ValueError("x heads must split evenly into wo_a's heads_per_group")
+    num_groups = num_heads // heads_per_group
     if out_features % num_groups:
         raise ValueError("wo_a columns must split evenly into groups")
     lora_rank = out_features // num_groups
@@ -208,12 +235,13 @@ def wo_a_projection(
             num_sub_t=tile_t // sub_t,
             quantize_activations=quantize,
             head_dim=head_dim,
+            heads_per_group=heads_per_group,
             interpret=interpret,
         ),
         out_shape=jax.ShapeDtypeStruct((num_tokens, out_features), out_dtype),
         grid=(num_groups, num_t_tiles, num_r_tiles),
         in_specs=[
-            pl.BlockSpec((tile_t, SUBLANE, head_dim), lambda g, t, r: (t, g, 0)),
+            pl.BlockSpec((tile_t, heads_per_group, head_dim), lambda g, t, r: (t, g, 0)),
             pl.BlockSpec((reduction, tile_r), lambda g, t, r: (0, g * num_r_tiles + r)),
             pl.BlockSpec((1, tile_r), lambda g, t, r: (0, g * num_r_tiles + r)),
             pl.BlockSpec((tile_t, 2 * LANE), lambda g, t, r: (t, 0)),
