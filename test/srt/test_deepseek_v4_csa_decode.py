@@ -83,7 +83,9 @@ def test_kernel_matches_numpy_reference(tokens, rows):
 
 
 def _long_path_inputs(seed=0):
-    B, H, D, DIDX, PAGE, NPAGES, W, RATIO, TOPK = 5, 8, 512, 128, 8, 128, 128, 4, 512
+    # PAGE = the production compressed page (page_size 128 // ratio 4 = 32 entries); the
+    # scorer DMAs whole pages, and 16-bit caches need 16-row-aligned pages on TPU7x.
+    B, H, D, DIDX, PAGE, NPAGES, W, RATIO, TOPK = 5, 8, 512, 128, 32, 32, 128, 4, 512
     k = jax.random.split(jax.random.PRNGKey(seed), 8)
     total_pages = 1 + B * NPAGES
     rng = np.random.default_rng(seed)

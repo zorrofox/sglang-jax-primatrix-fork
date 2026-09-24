@@ -293,6 +293,11 @@ def paged_csa_decode_scores(
     the kernel reads one page per DMA. The result [T,N*page_size] uses finite minimum
     FP32 for every invalid entry. Request isolation is encoded in the allocator-derived
     page table.
+
+    Pages are moved by whole-page DMAs, so ``page_size`` must be a multiple of the
+    cache's sublane tile: 16 rows for 16-bit caches (Mosaic rejects 8-row bf16 pages on
+    TPU7x with "Offsets along tiled dimensions must be aligned to tiles"), 8 rows
+    otherwise. Production uses ``page_size // ratio`` = 32 entries.
     """
     tokens, heads, dim = q.shape
     if cache.ndim == 3:
@@ -307,6 +312,11 @@ def paged_csa_decode_scores(
         raise ValueError("CSA decode query, weight, length and page-table shapes disagree")
     if cache.shape[-1] != dim or dim % 128 or page_size % 8 or capacity % 128:
         raise ValueError("CSA decode requires aligned cache pages and 128-wide key dimensions")
+    if jnp.dtype(cache.dtype).itemsize == 2 and page_size % 16:
+        raise ValueError(
+            "CSA decode pages of a 16-bit cache must be a multiple of 16 rows (the Mosaic "
+            f"sublane tile on TPU7x); got page_size={page_size}"
+        )
     block_k = scorer_block_k(capacity)
     pages_per_block = scorer_pages_per_block(capacity, page_size)
     blocks = capacity // block_k
