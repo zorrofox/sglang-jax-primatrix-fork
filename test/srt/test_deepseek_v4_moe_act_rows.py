@@ -36,9 +36,9 @@ def test_rows_match(rows, start, end, dtype):
     )
     assert out.shape == ref.shape
     if dtype == jnp.bfloat16 and _tpu_generation() == "v6e":
-        # v6e has no bf16 VPU: the kernel and the XLA reference round the silu in
-        # different places and differ by one bf16 ulp (09-24: max abs 0.5 at |v| in
-        # [64, 128), max rel 2**-7). v7x and f32 stay bit-equal.
+        # On v6e the kernel and the XLA reference differ by one bf16 ulp (measured:
+        # max abs 0.5 at |v| in [64, 128), max rel 2**-7), i.e. the silu is rounded
+        # at different points on this generation. v7x and f32 stay bit-equal.
         np.testing.assert_allclose(out[start:end], ref[start:end], rtol=2**-7, atol=2**-6)
     else:
         np.testing.assert_array_equal(out[start:end], ref[start:end])

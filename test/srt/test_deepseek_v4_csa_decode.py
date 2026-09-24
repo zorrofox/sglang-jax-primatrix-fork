@@ -43,10 +43,10 @@ def _tpu_generation() -> str:
     return "other"
 
 
-# Kernel-vs-numpy tolerance per TPU generation. v7x matches to 2e-4. v6e (single
-# TensorCore, no bf16 VPU) differs by up to 6.1e-4 abs on these shapes (09-24 run on
-# v6e 4x4: 3/8 cases over 2e-4, max 6.1e-4); JAX_DEFAULT_MATMUL_PRECISION=highest does
-# not change it, so it is accumulation/rounding order, not a precision flag.
+# Kernel-vs-numpy tolerance per TPU generation. v7x matches to 2e-4. v6e differs by
+# up to 6.1e-4 abs on these shapes (measured on a v6e host: 3/8 cases over 2e-4, max
+# 6.1e-4); JAX_DEFAULT_MATMUL_PRECISION=highest does not change it, so it is
+# accumulation/rounding order between generations, not a precision flag.
 _KERNEL_TOL = {"v6e": 1e-3}.get(_tpu_generation(), 2e-4)
 
 
